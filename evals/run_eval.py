@@ -58,19 +58,118 @@ def matches(gold_rows: list[tuple] | None, pred_rows: list[tuple] | None) -> boo
 
 def eval_one(question: dict, agent_url: str) -> dict:
     """Score one question. Return a dict capturing per-iteration correctness."""
-    raise NotImplementedError("Phase 5")
+    q_text = question["question"]
+    db_id = question["db_id"]
+    gold_sql = question["gold_sql"]
+
+    # Run gold SQL to get expected rows
+    gold_ok, gold_rows, gold_err = run_sql(db_id, gold_sql)
+    if not gold_ok:
+        return {
+            "question": q_text,
+            "db_id": db_id,
+            "gold_sql": gold_sql,
+            "gold_error": gold_err,
+            "agent_error": None,
+            "iterations": 0,
+            "correct_at_iteration": {},
+            "final_correct": False,
+            "skipped": True,
+        }
+
+    # Call the agent
+    try:
+        response = httpx.post(
+            agent_url,
+            json={"question": q_text, "db": db_id, "tags": {"phase": "5", "eval": "baseline"}},
+            timeout=120.0,
+        )
+        response.raise_for_status()
+        agent_result = response.json()
+    except Exception as e:
+        return {
+            "question": q_text,
+            "db_id": db_id,
+            "gold_sql": gold_sql,
+            "gold_error": None,
+            "agent_error": str(e),
+            "iterations": 0,
+            "correct_at_iteration": {},
+            "final_correct": False,
+            "skipped": False,
+        }
+
+    history = agent_result.get("history", [])
+    total_iterations = agent_result.get("iterations", 0)
+
+    # Check correctness at each iteration by replaying history
+    correct_at_iteration = {}
+    iteration = 0
+
+    for entry in history:
+        if entry["node"] in ("generate_sql", "revise"):
+            iteration += 1
+            last_sql = entry["sql"]
+            pred_ok, pred_rows, _ = run_sql(db_id, last_sql)
+            correct_at_iteration[iteration] = matches(gold_rows, pred_rows) if pred_ok else False
+
+    final_correct = correct_at_iteration.get(total_iterations, False)
+
+    return {
+        "question": q_text,
+        "db_id": db_id,
+        "gold_sql": gold_sql,
+        "agent_sql": agent_result.get("sql", ""),
+        "agent_error": None,
+        "iterations": total_iterations,
+        "correct_at_iteration": correct_at_iteration,
+        "final_correct": final_correct,
+        "skipped": False,
+    }
 
 
 def summarize(results: list[dict]) -> dict:
-    """Aggregate per-question results.
+    """Aggregate per-question results with per-iteration pass rates."""
+    total = len(results)
+    skipped = sum(1 for r in results if r.get("skipped"))
+    evaluated = total - skipped
 
-    Per-iteration carry-forward: if the agent terminated at iteration j < k
-    (verify said ok at j, or it hit MAX_ITERATIONS at j < k), treat the
-    question's iteration-k result as identical to its iteration-j result.
-    The agent stopped emitting; whatever it had at termination is what
-    would have been served had we polled at iteration k.
-    """
-    raise NotImplementedError("Phase 5")
+    max_iter = max(
+        (r["iterations"] for r in results if not r.get("skipped")),
+        default=3,
+    )
+    max_iter = max(max_iter, 3)
+
+    iter_correct = {i: 0 for i in range(1, max_iter + 1)}
+
+    for r in results:
+        if r.get("skipped"):
+            continue
+        correct_at = r.get("correct_at_iteration", {})
+        final_iter = r["iterations"]
+        final_result = r["final_correct"]
+
+        for i in range(1, max_iter + 1):
+            if i in correct_at:
+                iter_correct[i] += 1 if correct_at[i] else 0
+            elif i > final_iter:
+                iter_correct[i] += 1 if final_result else 0
+
+    iter_pass_rate = {
+        f"iter_{i}": round(iter_correct[i] / evaluated, 3) if evaluated > 0 else 0.0
+        for i in range(1, max_iter + 1)
+    }
+
+    final_correct = sum(1 for r in results if r.get("final_correct"))
+
+    return {
+        "total": total,
+        "skipped": skipped,
+        "evaluated": evaluated,
+        "final_correct": final_correct,
+        "final_pass_rate": round(final_correct / evaluated, 3) if evaluated > 0 else 0.0,
+        "per_iteration_pass_rate": iter_pass_rate,
+    }
 
 
 # ---------- Main (provided) --------------------------------------------
